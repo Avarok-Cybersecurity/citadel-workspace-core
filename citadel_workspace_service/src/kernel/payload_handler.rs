@@ -4,13 +4,14 @@ use citadel_logging::{error, info};
 use citadel_sdk::prefabs::ClientServerRemote;
 use citadel_sdk::prelude::*;
 use citadel_workspace_types::{
-    ConnectionFailure, DisconnectFailure, Disconnected, InternalServicePayload,
-    InternalServiceResponse, LocalDBClearAllKVFailure, LocalDBClearAllKVSuccess,
-    LocalDBDeleteKVFailure, LocalDBDeleteKVSuccess, LocalDBGetAllKVFailure, LocalDBGetAllKVSuccess,
-    LocalDBGetKVFailure, LocalDBGetKVSuccess, LocalDBSetKVFailure, LocalDBSetKVSuccess,
-    MessageReceived, MessageSendError, MessageSent, PeerConnectFailure, PeerConnectSuccess,
-    PeerDisconnectFailure, PeerDisconnectSuccess, PeerRegisterFailure, PeerRegisterSuccess,
-    SendFileFailure, SendFileSuccess,
+    ConnectionFailure, DeleteVirtualFileFailure, DeleteVirtualFileSuccess, DisconnectFailure,
+    Disconnected, DownloadFileFailure, DownloadFileSuccess, FileTransferStatus,
+    InternalServicePayload, InternalServiceResponse, LocalDBClearAllKVFailure,
+    LocalDBClearAllKVSuccess, LocalDBDeleteKVFailure, LocalDBDeleteKVSuccess,
+    LocalDBGetAllKVFailure, LocalDBGetAllKVSuccess, LocalDBGetKVFailure, LocalDBGetKVSuccess,
+    LocalDBSetKVFailure, LocalDBSetKVSuccess, MessageReceived, MessageSendError, MessageSent,
+    PeerConnectFailure, PeerConnectSuccess, PeerDisconnectFailure, PeerDisconnectSuccess,
+    PeerRegisterFailure, PeerRegisterSuccess, SendFileFailure, SendFileSuccess,
 };
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -19,14 +20,19 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 
 use uuid::Uuid;
+
+// TODO: wrap all matched error below inside a function that takes f(NetworkError, InternalServicePayload) -> PayloadHandlerError
+/*pub struct PayloadHandlerError {
+    pub error: NetworkError,
+    pub response_payload: InternalServicePayload,
+}*/
+
 #[async_recursion]
 pub async fn payload_handler(
     command: InternalServicePayload,
     server_connection_map: &Arc<Mutex<HashMap<u64, Connection>>>,
     remote: &mut NodeRemote,
-    tcp_connection_map: &Arc<
-        tokio::sync::Mutex<HashMap<Uuid, UnboundedSender<InternalServiceResponse>>>,
-    >,
+    tcp_connection_map: &Arc<Mutex<HashMap<Uuid, UnboundedSender<InternalServiceResponse>>>>,
 ) {
     match command {
         InternalServicePayload::Connect {
@@ -249,8 +255,11 @@ pub async fn payload_handler(
             uuid,
             source,
             cid,
+            is_refvs,
+            peer_cid,
             chunk_size,
-            transfer_type,
+            virtual_directory,
+            security_level,
         } => {
             let client_to_server_remote = ClientServerRemote::new(
                 VirtualTargetType::LocalGroupServer {
@@ -258,10 +267,65 @@ pub async fn payload_handler(
                 },
                 remote.clone(),
             );
-            match client_to_server_remote
-                .send_file_with_custom_opts(source, chunk_size, transfer_type)
-                .await
-            {
+
+            let chunk_size = chunk_size.unwrap_or_default();
+            let security_level = security_level.unwrap_or_default();
+            let virtual_directory = virtual_directory.unwrap_or_default();
+
+            let result = if let Some(peer_cid) = peer_cid {
+                match client_to_server_remote.find_target(cid, peer_cid).await {
+                    Ok(peer_remote) => {
+                        if is_refvs {
+                            peer_remote
+                                .remote_encrypted_virtual_filesystem_push_custom_chunking(
+                                    source,
+                                    virtual_directory,
+                                    chunk_size,
+                                    security_level,
+                                )
+                                .await
+                        } else {
+                            peer_remote
+                                .send_file_with_custom_opts(
+                                    source,
+                                    chunk_size,
+                                    TransferType::FileTransfer,
+                                )
+                                .await
+                        }
+                    }
+                    Err(err) => {
+                        send_response_to_tcp_client(
+                            tcp_connection_map,
+                            InternalServiceResponse::SendFileFailure(SendFileFailure {
+                                cid,
+                                message: err.to_string(),
+                            }),
+                            uuid,
+                        )
+                        .await;
+                        Err(err)
+                    }
+                }
+            } else {
+                // TODO: move the TransferType to the enum in the TCP client request
+                if is_refvs {
+                    client_to_server_remote
+                        .send_file_with_custom_opts(source, chunk_size, TransferType::FileTransfer)
+                        .await
+                } else {
+                    client_to_server_remote
+                        .remote_encrypted_virtual_filesystem_push_custom_chunking(
+                            source,
+                            virtual_directory,
+                            chunk_size,
+                            security_level,
+                        )
+                        .await
+                }
+            };
+
+            match result {
                 Ok(_) => {
                     send_response_to_tcp_client(
                         tcp_connection_map,
@@ -285,22 +349,247 @@ pub async fn payload_handler(
             }
         }
 
-        InternalServicePayload::DownloadFile {
-            virtual_path: _,
-            transfer_security_level: _,
-            delete_on_pull: _,
-            cid: _,
-            uuid: _,
+        InternalServicePayload::RespondFileTransfer {
+            uuid,
+            cid,
+            peer_cid,
+            object_id,
+            accept,
+            download_location: _,
         } => {
-            // let mut client_to_server_remote = ClientServerRemote::new(VirtualTargetType::LocalGroupServer { implicated_cid: cid }, remote.clone());
-            // match client_to_server_remote.(virtual_path, transfer_security_level, delete_on_pull).await {
-            //     Ok(_) => {
+            if let Some(connection) = server_connection_map.lock().await.get_mut(&cid) {
+                if let Some(mut handler) = connection.take_file_transfer_handle(peer_cid, object_id)
+                {
+                    if let Some(mut owned_handler) = handler.take() {
+                        let connection_map_clone = tcp_connection_map.clone();
+                        let result = if accept {
+                            let accept_result = owned_handler.accept();
+                            let tcp_client_metadata_updater = async move {
+                                let mut _path = None;
+                                while let Some(status) = owned_handler.next().await {
+                                    let status_string = match status {
+                                        ObjectTransferStatus::ReceptionBeginning(file_path, _) => {
+                                            _path = Some(file_path);
+                                            "ReceptionBeginning"
+                                        }
+                                        ObjectTransferStatus::ReceptionTick(_, _, _) => {
+                                            "ReceptionTick"
+                                        }
+                                        ObjectTransferStatus::ReceptionComplete => {
+                                            //TODO: Update to use metadata
+                                            "ReceptionComplete"
+                                        }
+                                        _ => "ReceptionEnded",
+                                    };
 
-            //     },
-            //     Err(err) => {
+                                    let message = InternalServiceResponse::FileTransferTick(
+                                        citadel_workspace_types::FileTransferTick {
+                                            uuid,
+                                            cid,
+                                            peer_cid,
+                                            status: String::from(status_string),
+                                        },
+                                    );
+                                    match connection_map_clone.lock().await.get(&uuid) {
+                                        Some(entry) => match entry.send(message) {
+                                            Ok(res) => res,
+                                            Err(_) => {
+                                                info!(target: "citadel", "File Transfer Status Tick Not Sent")
+                                            }
+                                        },
+                                        None => {
+                                            info!(target:"citadel","Connection not found during File Transfer Status Tick")
+                                        }
+                                    }
+                                }
+                            };
+                            tokio::task::spawn(tcp_client_metadata_updater);
+                            accept_result
+                        } else {
+                            owned_handler.decline()
+                        };
+                        match result {
+                            Ok(_) => {
+                                send_response_to_tcp_client(
+                                    tcp_connection_map,
+                                    InternalServiceResponse::FileTransferStatus(
+                                        FileTransferStatus {
+                                            cid,
+                                            object_id,
+                                            success: true,
+                                            response: accept,
+                                            message: None,
+                                        },
+                                    ),
+                                    uuid,
+                                )
+                                .await;
+                            }
 
-            //     }
-            // }
+                            Err(err) => {
+                                send_response_to_tcp_client(
+                                    tcp_connection_map,
+                                    InternalServiceResponse::FileTransferStatus(
+                                        FileTransferStatus {
+                                            cid,
+                                            object_id,
+                                            success: false,
+                                            response: accept,
+                                            message: Option::from(err.into_string()),
+                                        },
+                                    ),
+                                    uuid,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        InternalServicePayload::DownloadFile {
+            virtual_directory,
+            security_level,
+            delete_on_pull,
+            cid,
+            peer_cid,
+            uuid,
+        } => {
+            let client_to_server_remote = ClientServerRemote::new(
+                VirtualTargetType::LocalGroupServer {
+                    implicated_cid: cid,
+                },
+                remote.clone(),
+            );
+
+            let security_level = security_level.unwrap_or_default();
+
+            let result = if let Some(peer_cid) = peer_cid {
+                match client_to_server_remote.find_target(cid, peer_cid).await {
+                    Ok(peer_remote) => {
+                        peer_remote
+                            .remote_encrypted_virtual_filesystem_pull(
+                                virtual_directory,
+                                security_level,
+                                delete_on_pull,
+                            )
+                            .await
+                    }
+                    Err(err) => {
+                        send_response_to_tcp_client(
+                            tcp_connection_map,
+                            InternalServiceResponse::DownloadFileFailure(DownloadFileFailure {
+                                cid,
+                                message: err.to_string(),
+                            }),
+                            uuid,
+                        )
+                        .await;
+                        Err(err)
+                    }
+                }
+            } else {
+                client_to_server_remote
+                    .remote_encrypted_virtual_filesystem_pull(
+                        virtual_directory,
+                        security_level,
+                        delete_on_pull,
+                    )
+                    .await
+            };
+
+            match result {
+                Ok(_) => {
+                    send_response_to_tcp_client(
+                        tcp_connection_map,
+                        InternalServiceResponse::DownloadFileSuccess(DownloadFileSuccess { cid }),
+                        uuid,
+                    )
+                    .await;
+                }
+
+                Err(err) => {
+                    send_response_to_tcp_client(
+                        tcp_connection_map,
+                        InternalServiceResponse::DownloadFileFailure(DownloadFileFailure {
+                            cid,
+                            message: err.into_string(),
+                        }),
+                        uuid,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        InternalServicePayload::DeleteVirtualFile {
+            virtual_directory,
+            cid,
+            peer_cid,
+            uuid,
+        } => {
+            let client_to_server_remote = ClientServerRemote::new(
+                VirtualTargetType::LocalGroupServer {
+                    implicated_cid: cid,
+                },
+                remote.clone(),
+            );
+
+            let result = if let Some(peer_cid) = peer_cid {
+                match client_to_server_remote.find_target(cid, peer_cid).await {
+                    Ok(peer_remote) => {
+                        peer_remote
+                            .remote_encrypted_virtual_filesystem_delete(virtual_directory)
+                            .await
+                    }
+                    Err(err) => {
+                        send_response_to_tcp_client(
+                            tcp_connection_map,
+                            InternalServiceResponse::DeleteVirtualFileFailure(
+                                DeleteVirtualFileFailure {
+                                    cid,
+                                    message: err.to_string(),
+                                },
+                            ),
+                            uuid,
+                        )
+                        .await;
+                        Err(err)
+                    }
+                }
+            } else {
+                client_to_server_remote
+                    .remote_encrypted_virtual_filesystem_delete(virtual_directory)
+                    .await
+            };
+
+            match result {
+                Ok(_) => {
+                    send_response_to_tcp_client(
+                        tcp_connection_map,
+                        InternalServiceResponse::DeleteVirtualFileSuccess(
+                            DeleteVirtualFileSuccess { cid },
+                        ),
+                        uuid,
+                    )
+                    .await;
+                }
+
+                Err(err) => {
+                    send_response_to_tcp_client(
+                        tcp_connection_map,
+                        InternalServiceResponse::DeleteVirtualFileFailure(
+                            DeleteVirtualFileFailure {
+                                cid,
+                                message: err.into_string(),
+                            },
+                        ),
+                        uuid,
+                    )
+                    .await;
+                }
+            }
         }
 
         InternalServicePayload::StartGroup {
